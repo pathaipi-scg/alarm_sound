@@ -45,6 +45,9 @@ def load_alarm_mapping():
         a.TagPath,
         a.Mp3File,
         a.[Repeat],
+        a.AlarmMode,
+        a.ThresholdHigh,
+        a.ThresholdLow,
         t.NodeId
     FROM Alarm_Lists a
     INNER JOIN TagMaster t
@@ -69,7 +72,10 @@ def load_alarm_mapping():
             "tag_path": row.TagPath,
             "node_id": row.NodeId,
             "mp3_file": row.Mp3File,
-            "repeat": row.Repeat
+            "repeat": row.Repeat,
+            "alarm_mode": row.AlarmMode,
+            "threshold_high": row.ThresholdHigh,
+            "threshold_low": row.ThresholdLow
         })
 
     return alarms
@@ -107,6 +113,100 @@ def play_sound(mp3_file, repeat=3):
 
 
 # =====================================================
+# HISTORY
+# =====================================================
+
+def log_alarm_history(alarm, value):
+
+    try:
+        current = float(value)
+    except (ValueError, TypeError):
+        current = None
+
+    try:
+
+        conn = pyodbc.connect(
+            "DRIVER={SQL Server};"
+            f"SERVER={SQL_SERVER};"
+            f"DATABASE={SQL_DB};"
+            f"UID={SQL_USER};"
+            f"PWD={SQL_PASS};"
+            "TrustServerCertificate=yes;"
+        )
+
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            INSERT INTO Alarm_History
+                (AlarmId, TagId, TagPath, AlarmMode,
+                 ThresholdHigh, ThresholdLow, CurrentValue,
+                 Mp3File, CreatedTime)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, GETDATE())
+            """,
+            (
+                alarm["alarm_id"],
+                alarm["tag_id"],
+                alarm["tag_path"],
+                alarm.get("alarm_mode"),
+                alarm.get("threshold_high"),
+                alarm.get("threshold_low"),
+                current,
+                alarm["mp3_file"],
+            ),
+        )
+
+        conn.commit()
+        conn.close()
+
+        print(f"HISTORY LOGGED => AlarmId={alarm['alarm_id']}")
+
+    except Exception as ex:
+
+        print("LOG HISTORY ERROR")
+        print(ex)
+
+
+# =====================================================
+# ALARM CONDITION
+# =====================================================
+
+def should_trigger(alarm, value):
+    """
+    ตัดสินใจว่าค่าที่ได้ควรทำให้ alarm ร้องหรือไม่ โดยดูจาก ThresholdHigh / ThresholdLow
+    ใน Alarm_Lists เท่านั้น:
+
+      ThresholdHigh และ ThresholdLow เป็น NULL ทั้งคู่ -> digital : ร้องเมื่อ value == 1
+      นอกนั้น                                        -> analog  : ร้องเมื่อ value > High หรือ value < Low
+                                                                  (ฝั่งที่เป็น NULL จะถูกข้าม)
+    """
+
+    high = alarm.get("threshold_high")
+    low = alarm.get("threshold_low")
+
+    # ไม่มี threshold ทั้งคู่ -> digital
+    if high is None and low is None:
+        try:
+            return int(value) == 1
+        except (ValueError, TypeError):
+            return False
+
+    # analog
+    try:
+        v = float(value)
+    except (ValueError, TypeError):
+        return False
+
+    if high is not None and v > float(high):
+        return True
+
+    if low is not None and v < float(low):
+        return True
+
+    return False
+
+
+# =====================================================
 # OPC SUB
 # =====================================================
 
@@ -126,13 +226,15 @@ class AlarmHandler:
             value
         )
 
-        if value != 1:
-            return
-
         if nodeid not in self.mapping:
             return
 
         alarm = self.mapping[nodeid]
+
+        if not should_trigger(alarm, value):
+            return
+
+        log_alarm_history(alarm, value)
 
         play_sound(alarm["mp3_file"], alarm.get("repeat"))
 
