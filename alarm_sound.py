@@ -44,6 +44,7 @@ def load_alarm_mapping():
         a.TagId,
         a.TagPath,
         a.Mp3File,
+        a.[Repeat],
         t.NodeId
     FROM Alarm_Lists a
     INNER JOIN TagMaster t
@@ -67,7 +68,8 @@ def load_alarm_mapping():
             "tag_id": row.TagId,
             "tag_path": row.TagPath,
             "node_id": row.NodeId,
-            "mp3_file": row.Mp3File
+            "mp3_file": row.Mp3File,
+            "repeat": row.Repeat
         })
 
     return alarms
@@ -77,16 +79,26 @@ def load_alarm_mapping():
 # SOUND
 # =====================================================
 
-def play_sound(mp3_file):
+def play_sound(mp3_file, repeat=3):
 
     full_path = str(Path(MP3_FOLDER) / mp3_file)
 
-    print(f"PLAY => {full_path}")
+    # default to 3 plays when Repeat is NULL or invalid
+    try:
+        repeat = int(repeat)
+    except (ValueError, TypeError):
+        repeat = 3
+
+    if repeat < 1:
+        repeat = 3
+
+    print(f"PLAY x{repeat} => {full_path}")
 
     try:
 
         pygame.mixer.music.load(full_path)
-        pygame.mixer.music.play()
+        # pygame loops = number of REPEATS after the first play
+        pygame.mixer.music.play(loops=repeat - 1)
 
     except Exception as ex:
 
@@ -122,7 +134,7 @@ class AlarmHandler:
 
         alarm = self.mapping[nodeid]
 
-        play_sound(alarm["mp3_file"])
+        play_sound(alarm["mp3_file"], alarm.get("repeat"))
 
 
 # =====================================================
