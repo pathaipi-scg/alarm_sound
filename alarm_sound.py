@@ -10,6 +10,7 @@ import pygame
 import pyodbc
 
 from asyncua import Client
+from pyModbusTCP.client import ModbusClient
 
 
 # =====================================================
@@ -20,7 +21,29 @@ MP3_FOLDER = r"C:\Alarm"
 #print("CONFIG FILE =", __file__)
 #print("OPC_URL =", OPC_URL)
 
+# hot-reload signal: UI bumps this Modbus holding register whenever
+# Alarm_Lists changes (save / delete / refresh). Must match alarm_list.py.
+RELOAD_HOST = "172.28.231.251"
+RELOAD_PORT = 502
+RELOAD_REGISTER = 12002
+
 pygame.mixer.init()
+
+
+# =====================================================
+# RELOAD SIGNAL
+# =====================================================
+
+def read_reload_counter(client):
+    """Return current value of the reload register, or None on failure."""
+    try:
+        regs = client.read_holding_registers(RELOAD_REGISTER, 1)
+        if not regs:
+            return None
+        return regs[0]
+    except Exception as ex:
+        print("READ RELOAD REGISTER ERROR:", ex)
+        return None
 
 
 # =====================================================
@@ -243,12 +266,12 @@ class AlarmHandler:
 # MAIN
 # =====================================================
 
-async def main():
-
-    alarms = load_alarm_mapping()
+def build_node_mapping(alarms):
 
     print()
     print("=== ALARM LIST ===")
+
+    node_mapping = {}
 
     for a in alarms:
 
@@ -258,11 +281,35 @@ async def main():
             a["mp3_file"]
         )
 
-    node_mapping = {}
-
-    for a in alarms:
-
         node_mapping[a["node_id"]] = a
+
+    return node_mapping
+
+
+async def subscribe_all(client, sub, alarms):
+    """Subscribe data-change for every alarm node; return the handles."""
+
+    handles = []
+
+    for alarm in alarms:
+
+        node = client.get_node(alarm["node_id"])
+
+        handle = await sub.subscribe_data_change(node)
+        handles.append(handle)
+
+        print(
+            "SUB:",
+            alarm["node_id"]
+        )
+
+    return handles
+
+
+async def main():
+
+    alarms = load_alarm_mapping()
+    node_mapping = build_node_mapping(alarms)
 
     handler = AlarmHandler(node_mapping)
     print("OPC_URL =", OPC_URL)
@@ -277,16 +324,16 @@ async def main():
             handler
         )
 
-        for alarm in alarms:
+        await subscribe_all(client, sub, alarms)
 
-            node = client.get_node(alarm["node_id"])
-
-            await sub.subscribe_data_change(node)
-
-            print(
-                "SUB:",
-                alarm["node_id"]
-            )
+        # connect to the reload register and remember its current value
+        mb = ModbusClient(
+            host=RELOAD_HOST,
+            port=RELOAD_PORT,
+            auto_open=True
+        )
+        last_counter = read_reload_counter(mb)
+        print("RELOAD COUNTER START =", last_counter)
 
         print()
         print("Waiting alarm...")
@@ -294,6 +341,35 @@ async def main():
         while True:
 
             await asyncio.sleep(1)
+
+            counter = read_reload_counter(mb)
+
+            if counter is None or counter == last_counter:
+                continue
+
+            # Alarm_Lists changed in the UI -> reload everything
+            print(f"RELOAD SIGNAL {last_counter} -> {counter}")
+            last_counter = counter
+
+            # silence any sound from an alarm that may no longer exist
+            try:
+                pygame.mixer.music.stop()
+            except Exception as ex:
+                print("STOP SOUND ERROR:", ex)
+
+            try:
+                alarms = load_alarm_mapping()
+                node_mapping = build_node_mapping(alarms)
+                handler.mapping = node_mapping
+
+                # drop the old subscription and rebuild from the new list
+                await sub.delete()
+                sub = await client.create_subscription(100, handler)
+                await subscribe_all(client, sub, alarms)
+
+                print("RELOAD DONE")
+            except Exception as ex:
+                print("RELOAD ERROR:", ex)
 
 
 if __name__ == "__main__":
