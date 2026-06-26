@@ -10,7 +10,10 @@ import pygame
 import pyodbc
 
 from asyncua import Client
-from pyModbusTCP.client import ModbusClient
+
+import json
+from urllib import request, parse
+from urllib.error import URLError
 
 
 # =====================================================
@@ -21,11 +24,12 @@ MP3_FOLDER = r"C:\Alarm"
 #print("CONFIG FILE =", __file__)
 #print("OPC_URL =", OPC_URL)
 
-# hot-reload signal: UI bumps this Modbus holding register whenever
-# Alarm_Lists changes (save / delete / refresh). Must match alarm_list.py.
-RELOAD_HOST = "172.28.231.251"
-RELOAD_PORT = 502
-RELOAD_REGISTER = 12002
+# hot-reload signal: the UI (alarm_list.py) writes reload_alarm_sound=1 to
+# InfluxDB whenever Alarm_Lists changes (save / delete / refresh). This Mini-PC
+# has no Modbus/internet but reads InfluxDB, so the signal lives there. After
+# reloading we write the field back to 0 as an ack. Must match alarm_list.py.
+RELOAD_MEASUREMENT = "system"
+RELOAD_FIELD = "reload_alarm_sound"
 
 pygame.mixer.init()
 
@@ -34,16 +38,47 @@ pygame.mixer.init()
 # RELOAD SIGNAL
 # =====================================================
 
-def read_reload_counter(client):
-    """Return current value of the reload register, or None on failure."""
+# InfluxDB 1.8 talks plain HTTP, so we use stdlib urllib only -- the Mini-PC
+# has no internet and cannot pip install the influxdb client.
+
+def _influx_url(path, params):
+    """Build http://host:port/<path>?<params>, adding auth if configured."""
+    if INFLUX_USER:
+        params = dict(params, u=INFLUX_USER, p=INFLUX_PASS or "")
+    query = parse.urlencode(params)
+    return f"http://{INFLUX_HOST}:{INFLUX_PORT}/{path}?{query}"
+
+
+def read_reload_flag():
+    """Return latest reload_alarm_sound value, or None on failure / no data."""
     try:
-        regs = client.read_holding_registers(RELOAD_REGISTER, 1)
-        if not regs:
+        url = _influx_url("query", {
+            "db": INFLUX_DB,
+            "q": f'SELECT last("{RELOAD_FIELD}") FROM "{RELOAD_MEASUREMENT}"',
+        })
+        with request.urlopen(url, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+
+        # results -> series -> values[0] = [time, last]
+        series = data["results"][0].get("series")
+        if not series:
             return None
-        return regs[0]
-    except Exception as ex:
-        print("READ RELOAD REGISTER ERROR:", ex)
+        return series[0]["values"][0][1]
+    except (URLError, KeyError, IndexError, ValueError) as ex:
+        print("READ RELOAD FLAG ERROR:", ex)
         return None
+
+
+def write_reload_flag(value):
+    """Write reload_alarm_sound back (0 = ack done) via line protocol."""
+    try:
+        url = _influx_url("write", {"db": INFLUX_DB})
+        body = f"{RELOAD_MEASUREMENT} {RELOAD_FIELD}={int(value)}i".encode()
+        req = request.Request(url, data=body, method="POST")
+        with request.urlopen(req, timeout=5):
+            pass
+    except (URLError, ValueError) as ex:
+        print("WRITE RELOAD FLAG ERROR:", ex)
 
 
 # =====================================================
@@ -326,14 +361,9 @@ async def main():
 
         await subscribe_all(client, sub, alarms)
 
-        # connect to the reload register and remember its current value
-        mb = ModbusClient(
-            host=RELOAD_HOST,
-            port=RELOAD_PORT,
-            auto_open=True
-        )
-        last_counter = read_reload_counter(mb)
-        print("RELOAD COUNTER START =", last_counter)
+        # clear any stale reload request at startup
+        write_reload_flag(0)
+        print("RELOAD FLAG cleared at startup")
 
         print()
         print("Waiting alarm...")
@@ -342,14 +372,13 @@ async def main():
 
             await asyncio.sleep(1)
 
-            counter = read_reload_counter(mb)
+            flag = read_reload_flag()
 
-            if counter is None or counter == last_counter:
+            if flag != 1:
                 continue
 
             # Alarm_Lists changed in the UI -> reload everything
-            print(f"RELOAD SIGNAL {last_counter} -> {counter}")
-            last_counter = counter
+            print("RELOAD SIGNAL (reload_alarm_sound=1)")
 
             # silence any sound from an alarm that may no longer exist
             try:
@@ -370,6 +399,10 @@ async def main():
                 print("RELOAD DONE")
             except Exception as ex:
                 print("RELOAD ERROR:", ex)
+
+            # ack back to the UI that reload finished (even if it errored,
+            # so the UI does not hang waiting forever)
+            write_reload_flag(0)
 
 
 if __name__ == "__main__":
