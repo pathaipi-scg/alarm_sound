@@ -4,9 +4,8 @@ import queue
 import sys
 import threading
 import time
+from dataclasses import asdict
 from pathlib import Path
-from urllib import parse, request
-from urllib.error import URLError
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from config.config import *
@@ -14,19 +13,32 @@ from config.config import *
 import pygame
 import pyodbc
 from asyncua import Client
+from alarm_runtime import (
+    AlarmRuntimeStatus,
+    AlarmTransitionEngine,
+    ReloadSignalTracker,
+    create_reload_subscription,
+    group_alarms_by_node,
+    load_runtime_mapping,
+    normalize_repeat,
+    perform_health_read,
+    replace_alarm_subscription,
+    should_trigger as runtime_should_trigger,
+    utc_now,
+)
 
 
 # =====================================================
 # CONFIG
 # =====================================================
 
-MP3_FOLDER = r"C:\Alarm"
 RELOAD_MEASUREMENT = "system"
 RELOAD_FIELD = "reload_alarm_sound"
 
 # OPC connection watchdog
 OPC_HEALTHCHECK_INTERVAL = 5.0
 OPC_HEALTHCHECK_TIMEOUT = 5.0
+runtime_status = AlarmRuntimeStatus()
 
 
 # =====================================================
@@ -47,13 +59,7 @@ sql_log_queue = queue.Queue()
 # =====================================================
 
 def _normalize_repeat(value, default=3):
-    try:
-        repeat = int(value)
-    except (TypeError, ValueError):
-        repeat = default
-    if repeat < 1:
-        repeat = default
-    return repeat
+    return normalize_repeat(value, default)
 
 
 # =====================================================
@@ -84,7 +90,7 @@ def sound_worker():
                 continue
 
             mp3_file = item.get("mp3_file")
-            repeat = _normalize_repeat(item.get("repeat"), 3)
+            repeat = normalize_repeat(item.get("repeat"), 3)
             full_path = str(Path(MP3_FOLDER) / mp3_file)
 
             print(f"[SOUND] {full_path}")
@@ -121,14 +127,7 @@ threading.Thread(target=sound_worker, daemon=True).start()
 def _sql_connection():
     while True:
         try:
-            return pyodbc.connect(
-                f"DRIVER={{{SQL_DRIVER}}};"
-                f"SERVER={SQL_SERVER};"
-                f"DATABASE={SQL_DB};"
-                f"UID={SQL_USER};"
-                f"PWD={SQL_PASS};"
-                "TrustServerCertificate=yes;"
-            )
+            return pyodbc.connect(sql_connection_string())
         except Exception as ex:
             print("SQL CONNECT ERROR:", ex)
             time.sleep(5)
@@ -190,17 +189,6 @@ threading.Thread(target=sql_log_worker, daemon=True).start()
 
 
 # =====================================================
-# RELOAD SIGNAL
-# =====================================================
-
-def _influx_url(path, params):
-    """Build http://host:port/<path>?<params>, adding auth if configured."""
-    if INFLUX_USER:
-        params = dict(params, u=INFLUX_USER, p=INFLUX_PASS or "")
-    query = parse.urlencode(params)
-    return f"http://{INFLUX_HOST}:{INFLUX_PORT}/{path}?{query}"
-
-# =====================================================
 # SQL
 # =====================================================
 
@@ -229,6 +217,8 @@ def load_alarm_mapping():
         INNER JOIN TagMaster t
             ON a.TagId = t.TagId
         WHERE a.EnableAlarm = 1
+          AND t.IsActive = 1
+          AND UPPER(a.AlarmMode) IN ('HIGH', 'LOW')
         """
 
         cur = conn.cursor()
@@ -298,103 +288,48 @@ def log_alarm_history(alarm, value):
 # ALARM CONDITION
 # =====================================================
 def should_trigger(alarm, value):
-
-    mode = (alarm.get("alarm_mode") or "HIGH").upper()
-
-    high = alarm.get("threshold_high")
-    low = alarm.get("threshold_low")
-
-    # ----------------------------
-    # Digital Alarm
-    # ----------------------------
-    if high is None and low is None:
-
-        try:
-            v = int(value)
-        except (ValueError, TypeError):
-            return False
-
-        if mode == "LOW":
-            return v == 0
-
-        return v == 1
-
-    # ----------------------------
-    # Analog Alarm
-    # ----------------------------
-    try:
-        v = float(value)
-    except (ValueError, TypeError):
-        return False
-
-    if mode == "HIGH":
-        if high is None:
-            return False
-        return v > float(high)
-
-    if mode == "LOW":
-        if low is None:
-            return False
-        return v < float(low)
-
-    return False
+    """Compatibility wrapper; runtime and simulator share alarm_runtime."""
+    return runtime_should_trigger(alarm, value)
 # =====================================================
 # OPC SUB
 # =====================================================
 
 class AlarmHandler:
-    def __init__(self, mapping):
-        self.mapping = mapping
-        self.active = {}
+    def __init__(self, mapping=None):
+        self.engine = AlarmTransitionEngine(mapping or {}, self._trigger)
+
+    @property
+    def mapping(self):
+        return self.engine.mapping
+
+    @mapping.setter
+    def mapping(self, value):
+        self.engine.replace_mapping(value)
+
+    @property
+    def active(self):
+        return self.engine.active
+
+    def _trigger(self, alarm, value):
+        print(f"[TRIGGER] AlarmId={alarm['alarm_id']}")
+        log_alarm_history(alarm, value)
+        enqueue_sound(alarm["mp3_file"], normalize_repeat(alarm.get("repeat"), 3))
 
     def datachange_notification(self, node, value, data):
         nodeid = node.nodeid.to_string()
         print(f"{node} => {value}")
         print(time.strftime("%H:%M:%S"), nodeid, value)
 
-        if nodeid not in self.mapping:
-            return
-
-        alarms = self.mapping[nodeid]
-
-        for alarm in alarms:
-            alarm_id = alarm["alarm_id"]
-            trigger = should_trigger(alarm, value)
-            active = self.active.get(alarm_id, False)
-
-            print(
-                f"[CHECK] "
-                f"AlarmId={alarm_id} "
-                f"Tag={alarm['tag_path']} "
-                f"Mode={alarm.get('alarm_mode')} "
-                f"High={alarm.get('threshold_high')} "
-                f"Low={alarm.get('threshold_low')} "
-                f"Value={value} "
-                f"Trigger={trigger} "
-                f"Active={active}"
-            )
-            # เกิด Alarm ครั้งแรก
-            if trigger and not active:
-                print(f"[TRIGGER] AlarmId={alarm_id}")
-                self.active[alarm_id] = True
-                log_alarm_history(alarm, value)
-                enqueue_sound(
-                    alarm["mp3_file"],
-                    alarm.get("repeat") or 3
-                )
-
-            # Alarm หาย
-            elif not trigger and active:
-                print(f"[CLEAR] AlarmId={alarm_id}")
-                self.active[alarm_id] = False
+        for event in self.engine.process_value(nodeid, value):
+            print(f"[ALARM {event['event'].upper()}] AlarmId={event['alarm_id']} Active={event['active']}")
 
 
 
 class SystemHandler:
 
-    def __init__(self):
+    def __init__(self, status):
         self.reload_requested = False
-        self.reload_value = None
+        self.tracker = ReloadSignalTracker(status)
 
     def datachange_notification(self, node, value, data):
 
@@ -406,16 +341,15 @@ class SystemHandler:
             return
 
         # ครั้งแรกที่ Subscribe เข้ามา ให้จำค่าไว้เฉย ๆ
-        if self.reload_value is None:
-            self.reload_value = value
+        if not self.tracker.initialized:
+            self.tracker.observe(value)
             return
 
         # ค่าเดิม ไม่ต้องทำอะไร
-        if value == self.reload_value:
+        if not self.tracker.observe(value):
             return
 
         # ค่าเปลี่ยนจริง จึงสั่ง Reload
-        self.reload_value = value
         self.reload_requested = True
 
 # =====================================================
@@ -426,7 +360,7 @@ def build_node_mapping(alarms):
     print()
     print("=== ALARM LIST ===")
 
-    node_mapping = {}
+    node_mapping = group_alarms_by_node(alarms)
     for alarm in alarms:
         print(
         f"AlarmId={alarm['alarm_id']}"
@@ -435,54 +369,17 @@ def build_node_mapping(alarms):
         f" Repeat={alarm['repeat']}"
         f" MP3={alarm['mp3_file']}"
         )
-        nodeid = alarm["node_id"]
-        if nodeid not in node_mapping:
-            node_mapping[nodeid] = []
-        node_mapping[nodeid].append(alarm)
-
     return node_mapping
 
 
-async def subscribe_all(client, sub, alarms):
-
-    handles = []
-    subscribed = set()
-    for alarm in alarms:
-        nodeid = alarm["node_id"]
-        if nodeid in subscribed:
-            continue
-        subscribed.add(nodeid)
-        node = client.get_node(nodeid)
-        handle = await sub.subscribe_data_change(node)
-        handles.append(handle)
-        print("SUB:", nodeid)
-        
-    return handles
-
-
 async def reload_subscriptions(client, sub, alarms, handler):
-    try:
-        if sub is not None:
-            await sub.delete()
-    except Exception as ex:
-        print("DELETE SUB ERROR:", ex)
-
-    new_sub = await client.create_subscription(1000, handler)
-    await subscribe_all(client, new_sub, alarms)
+    new_sub, node_ids = await replace_alarm_subscription(client, sub, alarms, handler)
+    runtime_status.subscribed_alarm_node_ids = len(node_ids)
     return new_sub
 
-async def subscribe_system(client, sub):
-
-    node = client.get_node(RELOAD_ALARM_NODE)
-
-    await sub.subscribe_data_change(node)
-
-    print("SUB:", RELOAD_ALARM_NODE)
-
 async def main():
-    alarms = load_alarm_mapping()
-    node_mapping = build_node_mapping(alarms)
-    #handler = AlarmHandler(node_mapping)
+    alarm_handler = AlarmHandler()
+    connected_once = False
 
     print("OPC_URL =", OPC_URL)
 
@@ -492,32 +389,28 @@ async def main():
             async with Client(OPC_URL) as client:
                 print()
                 print("Connected OPC")
+                runtime_status.opc_connected = True
+                if connected_once:
+                    runtime_status.last_reconnect_time = utc_now()
+                connected_once = True
 
-                alarm_handler = AlarmHandler(node_mapping)
-                system_handler = SystemHandler()
-
-                alarm_sub = await client.create_subscription(
-                    1000,
-                    alarm_handler
+                # Reload SQL on every successful OPC session. A counter change
+                # while this process was offline therefore cannot leave stale
+                # Alarm mappings after reconnect.
+                alarms = load_runtime_mapping(
+                    load_alarm_mapping, alarm_handler.engine, runtime_status
                 )
-
-                system_sub = await client.create_subscription(
-                    1000,
-                    system_handler
+                build_node_mapping(alarms)
+                system_handler = SystemHandler(runtime_status)
+                alarm_sub = await reload_subscriptions(
+                    client, None, alarms, alarm_handler
                 )
-
-                await subscribe_all(
-                    client,
-                    alarm_sub,
-                    alarms
-                )
-
-                await subscribe_system(
-                    client,
-                    system_sub
+                _system_sub = await create_reload_subscription(
+                    client, RELOAD_ALARM_NODE, system_handler
                 )
 
                 print("System subscription ready")
+                print("[RUNTIME STATUS]", json.dumps(asdict(runtime_status), default=str))
 
                 # Use the reload node as a lightweight OPC heartbeat.
                 # If asyncua's internal publish loop gets disconnected and only
@@ -533,9 +426,8 @@ async def main():
                     if now - last_healthcheck >= OPC_HEALTHCHECK_INTERVAL:
                         last_healthcheck = now
                         try:
-                            await asyncio.wait_for(
-                                health_node.read_value(),
-                                timeout=OPC_HEALTHCHECK_TIMEOUT
+                            await perform_health_read(
+                                health_node, runtime_status, OPC_HEALTHCHECK_TIMEOUT
                             )
                         except Exception as ex:
                             print("OPC HEALTH CHECK FAILED:", ex)
@@ -553,11 +445,13 @@ async def main():
                     sound_command_queue.put({"action": "stop"})
 
                     try:
-                        alarms = load_alarm_mapping()
-                        node_mapping = build_node_mapping(alarms)
-                        #handler.mapping = node_mapping
-                        alarm_handler.mapping = node_mapping
-                        alarm_handler.active.clear()
+                        alarms = load_runtime_mapping(
+                            load_alarm_mapping,
+                            alarm_handler.engine,
+                            runtime_status,
+                            is_reload=True,
+                        )
+                        build_node_mapping(alarms)
                         alarm_sub = await reload_subscriptions(
                             client,
                             alarm_sub,
@@ -565,12 +459,16 @@ async def main():
                             alarm_handler
                         )
                         print("RELOAD DONE")
+                        print("[RUNTIME STATUS]", json.dumps(asdict(runtime_status), default=str))
                     except Exception as ex:
+                        runtime_status.last_reload_error = "mapping_or_subscription_reload_failed"
                         print("RELOAD ERROR:", ex)
 
         except asyncio.CancelledError:
             raise
         except Exception as ex:
+            runtime_status.opc_connected = False
+            runtime_status.reconnect_count += 1
             print("OPC SESSION ERROR:", ex)
             print("Reconnecting OPC in 5 seconds...")
             await asyncio.sleep(5)
