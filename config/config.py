@@ -2,6 +2,8 @@ from dotenv import load_dotenv
 from pathlib import Path
 import os
 
+from config.sql_connection import build_sql_connection_string
+
 env_path = Path(__file__).parent / ".env"
 load_dotenv(env_path)
 
@@ -21,30 +23,14 @@ if SQL_ENCRYPT not in {"yes", "no"}:
     raise RuntimeError("SQL_ENCRYPT must be yes or no")
 
 
-import pyodbc
-drivers = pyodbc.drivers()
-
-for d in (
-    "ODBC Driver 18 for SQL Server",
-    "ODBC Driver 17 for SQL Server",
-    "SQL Server",
-):
-    if d in drivers:
-        SQL_DRIVER = d
-        break
-else:
-    raise RuntimeError(
-        f"No supported SQL Server ODBC Driver found.\n"
-        f"Installed drivers: {drivers}"
-    )
+SQL_DRIVER = os.getenv("SQL_DRIVER", "AUTO")
 
 
 def sql_connection_string():
-    trust = "yes" if SQL_TRUST_SERVER_CERTIFICATE else "no"
-    return (
-        f"DRIVER={{{SQL_DRIVER}}};SERVER={SQL_SERVER};DATABASE={SQL_DB};"
-        f"UID={SQL_USER};PWD={SQL_PASS};Encrypt={SQL_ENCRYPT};"
-        f"TrustServerCertificate={trust};"
+    return build_sql_connection_string(
+        driver=SQL_DRIVER, server=SQL_SERVER, database=SQL_DB,
+        username=SQL_USER, password=SQL_PASS, encrypt=SQL_ENCRYPT,
+        trust_server_certificate=SQL_TRUST_SERVER_CERTIFICATE,
     )
 
 
