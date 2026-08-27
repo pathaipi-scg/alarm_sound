@@ -2,6 +2,8 @@
 
 cd /d C:\AI\alarm_sound
 
+call .venv\scripts\activate
+
 :loop
 
 python alarm_sound_v11.py
