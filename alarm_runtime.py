@@ -67,6 +67,7 @@ class AlarmRuntimeStatus:
     last_selected_mp3: str | None = None
     audio_initialized: bool = False
     last_playback_result: str | None = None
+    line_name: str | None = None
 
 
 @dataclass(slots=True)

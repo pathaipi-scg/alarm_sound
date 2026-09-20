@@ -61,3 +61,14 @@ config/tagmaster.json
 
 dist/
 build/
+# Private profiles and generated local artifacts
+.env.*
+!.env.example
+!config/.env.example
+.pytest_cache/
+*.sqlite
+*.sqlite3
+*.db
+*.jsonl
+VC_redist.x64.exe
+msodbcsql.msi

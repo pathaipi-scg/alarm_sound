@@ -38,7 +38,7 @@ RELOAD_FIELD = "reload_alarm_sound"
 # OPC connection watchdog
 OPC_HEALTHCHECK_INTERVAL = 5.0
 OPC_HEALTHCHECK_TIMEOUT = 5.0
-runtime_status = AlarmRuntimeStatus()
+runtime_status = AlarmRuntimeStatus(line_name=LINE_NAME or None)
 
 
 # =====================================================
@@ -138,15 +138,14 @@ def _persist_alarm_history(payload):
     try:
         conn = _sql_connection()
         cur = conn.cursor()
-        cur.execute(
-            """
+        sql = """
             INSERT INTO Alarm_History
                 (AlarmId, TagId, TagPath, AlarmMode,
                  ThresholdHigh, ThresholdLow, CurrentValue,
                  Mp3File, CreatedTime)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, GETDATE())
-            """,
-            (
+            """
+        params = (
                 payload["alarm_id"],
                 payload["tag_id"],
                 payload["tag_path"],
@@ -155,8 +154,17 @@ def _persist_alarm_history(payload):
                 payload.get("threshold_low"),
                 payload["current_value"],
                 payload["mp3_file"],
-            ),
-        )
+            )
+        if LINE_NAME:
+            sql = """
+            INSERT INTO dbo.Alarm_History
+                (AlarmId, TagId, TagPath, AlarmMode,
+                 ThresholdHigh, ThresholdLow, CurrentValue,
+                 Mp3File, CreatedTime, LineName)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, GETDATE(), ?)
+            """
+            params += (LINE_NAME,)
+        cur.execute(sql, params)
         conn.commit()
         print(f"HISTORY LOGGED => AlarmId={payload['alarm_id']}")
     except Exception as ex:
@@ -222,7 +230,14 @@ def load_alarm_mapping():
         """
 
         cur = conn.cursor()
-        cur.execute(sql)
+        if LINE_NAME:
+            sql = sql.replace("FROM Alarm_Lists a", "FROM dbo.Alarm_Lists a")
+            sql = sql.replace("INNER JOIN TagMaster t", "INNER JOIN dbo.TagMaster t")
+            sql += """ AND a.LineName = ? AND t.LineName = a.LineName
+                       AND (a.TagPath = t.Path OR a.TagPath = REPLACE(t.Path, '/', '.'))"""
+            cur.execute(sql, (LINE_NAME,))
+        else:
+            cur.execute(sql)
         rows = cur.fetchall()
 
         alarms = []
@@ -257,7 +272,10 @@ def load_alarm_mapping():
 # =====================================================
 
 def enqueue_sound(mp3_file, repeat=3):
+    if not mp3_file:
+        return False
     sound_command_queue.put({"action": "play", "mp3_file": mp3_file, "repeat": repeat})
+    return True
 
 
 # =====================================================
@@ -313,7 +331,8 @@ class AlarmHandler:
     def _trigger(self, alarm, value):
         print(f"[TRIGGER] AlarmId={alarm['alarm_id']}")
         log_alarm_history(alarm, value)
-        enqueue_sound(alarm["mp3_file"], normalize_repeat(alarm.get("repeat"), 3))
+        if alarm.get("mp3_file"):
+            enqueue_sound(alarm["mp3_file"], normalize_repeat(alarm.get("repeat"), 3))
 
     def datachange_notification(self, node, value, data):
         nodeid = node.nodeid.to_string()
@@ -382,6 +401,7 @@ async def main():
     connected_once = False
 
     print("OPC_URL =", OPC_URL)
+    print("LINE_NAME =", LINE_NAME or "(legacy: unset)")
 
     while True:
         try:

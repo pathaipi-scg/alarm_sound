@@ -4,8 +4,21 @@ import os
 
 from config.sql_connection import build_sql_connection_string
 
-env_path = Path(__file__).parent / ".env"
-load_dotenv(env_path)
+_profile = os.environ.get("ALARM_SOUND_ENV_FILE")
+env_path = Path(__file__).resolve().parent / ".env"
+if _profile is not None:
+    if not _profile.strip():
+        raise RuntimeError("ALARM_SOUND_ENV_FILE must not be blank")
+    env_path = Path(_profile)
+    if not env_path.is_absolute():
+        env_path = Path(__file__).resolve().parents[1] / env_path
+    if not env_path.is_file():
+        raise RuntimeError(f"Environment profile does not exist: {env_path}")
+load_dotenv(env_path, override=_profile is not None)
+
+# Blank/unset retains the legacy single-line SQL behavior.
+# LINE_ID is a deprecated input alias only; runtime and SQL use LineName.
+LINE_NAME = (os.getenv("LINE_NAME", "").strip() or os.getenv("LINE_ID", "").strip()).upper()
 
 # OPC
 OPC_URL = os.getenv("OPC_URL")
